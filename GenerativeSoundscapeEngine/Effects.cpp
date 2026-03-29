@@ -1,166 +1,443 @@
-#include "Effects.h"
+/*
+ *  GENERATIVE SOUNDSCAPE ENGINE — Bela
+ *
+ *  Knobs 0-7: Density, Reverb, Delay, DelayTime,
+ *             Drive, Filter, Texture, Volume
+ *  LEDs 0-3:  Activity, Trigger, Level, Heartbeat
+ */
+
+#include <Bela.h>
+#include <libraries/sndfile/sndfile.h>
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>
+#include <dirent.h>
+#include "Effects.h"
 
-/* ── OnePole ──────────────────────────────── */
+/* ── Config ─────────────────────────────── */
+#define MAX_VOICES   10
+#define MAX_SAMPLES  112
+#define ENV_ATK      0.5f
+#define ENV_REL      0.5f
+#define REL_EARLY    0.6f
+#define MAX_SMP_FRAMES (44100 * 60)  /* cap at 60 seconds per sample */
 
-void onepole_init(OnePole* f, float sr) {
-    f->sr = sr; f->a = 1.0f; f->z = 0;
-}
-void onepole_setCutoff(OnePole* f, float hz) {
-    float w = 2.0f * M_PI * hz / f->sr;
-    f->a = w / (1.0f + w);
-}
-float onepole_process(OnePole* f, float in) {
-    f->z += f->a * (in - f->z);
-    return f->z;
+/* ── Sample bank (stored as 16-bit to halve RAM) ── */
+static short* gSmpData[MAX_SAMPLES];
+static int    gSmpLen[MAX_SAMPLES];
+static float  gSmpEnergy[MAX_SAMPLES];
+static char   gSmpName[MAX_SAMPLES][64]; /* short filename for console */
+static int    gSmpOrder[MAX_SAMPLES]; /* sorted by energy */
+static int    gSmpCount = 0;
+
+/* ── Voice ──────────────────────────────── */
+typedef struct {
+    int   active;
+    int   smpIdx;
+    float pos, pitch, level, pan;
+    int   released;
+    Env   env;
+} Voice;
+
+static Voice gV[MAX_VOICES];
+
+/* ── Effects ────────────────────────────── */
+static Reverb gRevL, gRevR;
+static Delay  gDlyL, gDlyR;
+static Drive  gOvdL, gOvdR;
+static SVF    gFltL, gFltR;
+
+/* ── State ──────────────────────────────── */
+static float gKnob[8];
+static int   gClock = 0, gNextTrig = 0;
+static float gTrigLed = 0, gHbPhase = 0;
+static unsigned int gSeed = 54321;
+
+/* ── xorshift RNG ───────────────────────── */
+static float rndF(float lo, float hi) {
+    gSeed ^= gSeed << 13;
+    gSeed ^= gSeed >> 17;
+    gSeed ^= gSeed << 5;
+    float t = (float)(gSeed & 0xFFFF) / 65535.0f;
+    return lo + t * (hi - lo);
 }
 
-/* ── SVF ──────────────────────────────────── */
+/* ── Load one wav via libsndfile ─────────── */
+/* Reads in small chunks to avoid large temporary buffers */
+#define LOAD_CHUNK 4096
 
-void svf_init(SVF* f, float sr) {
-    f->sr = sr; f->f = 0.1f; f->q = 0.5f;
-    f->lp = f->bp = f->hp = 0;
-}
-void svf_setParams(SVF* f, float cutoff, float res) {
-    float c = cutoff;
-    /* Limit to sr/6 — Chamberlin SVF is unstable above ~sr/4 */
-    float maxCut = f->sr * 0.16f;
-    if (c > maxCut) c = maxCut;
-    if (c < 20.0f) c = 20.0f;
-    f->f = 2.0f * sinf(3.14159265f * c / f->sr);
-    /* Clamp coefficient for absolute safety */
-    if (f->f > 0.9f) f->f = 0.9f;
-    float r = res;
-    if (r < 0.5f) r = 0.5f;
-    f->q = 1.0f / r;
-}
-float svf_process(SVF* f, float in) {
-    f->hp = in - f->lp - f->q * f->bp;
-    f->bp += f->f * f->hp;
-    f->lp += f->f * f->bp;
-    /* Kill NaN / denormals — if it blows up, reset */
-    if (!(f->lp >= -100.0f && f->lp <= 100.0f)) {
-        f->lp = f->bp = f->hp = 0;
+static int loadOneWav(const char* path) {
+    if (gSmpCount >= MAX_SAMPLES) return 0;
+
+    SF_INFO info;
+    memset(&info, 0, sizeof(info));
+    SNDFILE* sf = sf_open(path, SFM_READ, &info);
+    if (!sf) return 0;
+
+    int frames = (int)info.frames;
+    int ch = info.channels;
+    if (frames <= 0 || ch <= 0) { sf_close(sf); return 0; }
+
+    /* Cap length to save RAM */
+    if (frames > MAX_SMP_FRAMES) frames = MAX_SMP_FRAMES;
+
+    /* Allocate 16-bit mono output */
+    short* mono = (short*)malloc(frames * sizeof(short));
+    if (!mono) { sf_close(sf); return 0; }
+
+    /* Read in small chunks, mix to mono, convert to int16 */
+    float chunk[LOAD_CHUNK * 2]; /* supports up to stereo */
+    int written = 0;
+    double rmsSum = 0;
+
+    while (written < frames) {
+        int toRead = frames - written;
+        if (toRead > LOAD_CHUNK) toRead = LOAD_CHUNK;
+        /* For >2 channels, use a heap buffer */
+        float* buf = chunk;
+        float* heapBuf = NULL;
+        if (ch > 2) {
+            heapBuf = (float*)malloc(toRead * ch * sizeof(float));
+            if (!heapBuf) break;
+            buf = heapBuf;
+        }
+
+        int got = (int)sf_readf_float(sf, buf, toRead);
+        if (got <= 0) { if (heapBuf) free(heapBuf); break; }
+
+        int i, c;
+        for (i = 0; i < got; i++) {
+            float s = 0;
+            for (c = 0; c < ch; c++)
+                s += buf[i * ch + c];
+            s /= (float)ch;
+            rmsSum += (double)s * s;
+            /* Convert to int16 */
+            int v = (int)(s * 32767.0f);
+            if (v > 32767) v = 32767;
+            if (v < -32768) v = -32768;
+            mono[written + i] = (short)v;
+        }
+        written += got;
+        if (heapBuf) free(heapBuf);
     }
-    return f->lp;
+    sf_close(sf);
+
+    if (written == 0) { free(mono); return 0; }
+
+    float rms = sqrtf((float)(rmsSum / written));
+
+    int idx = gSmpCount;
+    gSmpData[idx]   = mono;
+    gSmpLen[idx]    = written;
+    gSmpEnergy[idx] = rms;
+
+    /* Extract just the filename from the path */
+    const char* slash = strrchr(path, '/');
+    const char* name = slash ? slash + 1 : path;
+    strncpy(gSmpName[idx], name, 63);
+    gSmpName[idx][63] = '\0';
+
+    gSmpCount++;
+
+    rt_printf("  [%d] %s  %d fr  rms=%.4f\n", idx, path, written, rms);
+    return 1;
 }
 
-/* ── Reverb ───────────────────────────────── */
+/* ── Load all wavs from directory ────────── */
+static void loadSamples(const char* dir) {
+    DIR* d = opendir(dir);
+    if (!d) { rt_printf("Cannot open %s\n", dir); return; }
 
-void reverb_init(Reverb* r, float sr) {
-    float sc = sr / 44100.0f;
-    r->decay = 0.85f;
-    r->combLen[0] = (int)(1557*sc); if(r->combLen[0]>=REV_MAX) r->combLen[0]=REV_MAX-1;
-    r->combLen[1] = (int)(1617*sc); if(r->combLen[1]>=REV_MAX) r->combLen[1]=REV_MAX-1;
-    r->combLen[2] = (int)(1491*sc); if(r->combLen[2]>=REV_MAX) r->combLen[2]=REV_MAX-1;
-    r->combLen[3] = (int)(1422*sc); if(r->combLen[3]>=REV_MAX) r->combLen[3]=REV_MAX-1;
-    r->apLen[0]   = (int)(225*sc);  if(r->apLen[0]>=REV_MAX) r->apLen[0]=REV_MAX-1;
-    r->apLen[1]   = (int)(556*sc);  if(r->apLen[1]>=REV_MAX) r->apLen[1]=REV_MAX-1;
+    /* Collect names (simple fixed buffer) */
+    char paths[MAX_SAMPLES][256];
+    int n = 0;
+    struct dirent* e;
+    while ((e = readdir(d)) != NULL && n < MAX_SAMPLES) {
+        int len = strlen(e->d_name);
+        if (len < 5) continue;
+        const char* ext = e->d_name + len - 4;
+        if ((ext[0]=='.' || ext[0]=='.') &&
+            (ext[1]=='w' || ext[1]=='W') &&
+            (ext[2]=='a' || ext[2]=='A') &&
+            (ext[3]=='v' || ext[3]=='V'))
+        {
+            snprintf(paths[n], 256, "%s/%s", dir, e->d_name);
+            n++;
+        }
+    }
+    closedir(d);
+
+    /* Simple sort */
+    int i, j;
+    for (i = 0; i < n - 1; i++) {
+        for (j = i + 1; j < n; j++) {
+            if (strcmp(paths[j], paths[i]) < 0) {
+                char tmp[256];
+                memcpy(tmp, paths[i], 256);
+                memcpy(paths[i], paths[j], 256);
+                memcpy(paths[j], tmp, 256);
+            }
+        }
+    }
+
+    for (i = 0; i < n; i++)
+        loadOneWav(paths[i]);
+
+    /* Normalise energy to 0..1 */
+    float maxE = 0;
+    for (i = 0; i < gSmpCount; i++)
+        if (gSmpEnergy[i] > maxE) maxE = gSmpEnergy[i];
+    if (maxE > 0)
+        for (i = 0; i < gSmpCount; i++)
+            gSmpEnergy[i] /= maxE;
+
+    /* Build sorted index (quiet first) */
+    for (i = 0; i < gSmpCount; i++) gSmpOrder[i] = i;
+    for (i = 0; i < gSmpCount - 1; i++) {
+        for (j = i + 1; j < gSmpCount; j++) {
+            if (gSmpEnergy[gSmpOrder[j]] < gSmpEnergy[gSmpOrder[i]]) {
+                int tmp = gSmpOrder[i];
+                gSmpOrder[i] = gSmpOrder[j];
+                gSmpOrder[j] = tmp;
+            }
+        }
+    }
+
+    /* Report memory usage */
+    long totalBytes = 0;
+    for (i = 0; i < gSmpCount; i++)
+        totalBytes += gSmpLen[i] * (long)sizeof(short);
+    rt_printf("Loaded %d samples. Total RAM: %.1f MB (16-bit)\n",
+              gSmpCount, totalBytes / (1024.0f * 1024.0f));
+}
+
+/* ── Energy-biased selection ─────────────── */
+static int selectSample(float texture) {
+    if (gSmpCount <= 1) return 0;
+    float target = texture * (gSmpCount - 1);
+    float spread = gSmpCount * 0.2f;
+    if (spread < 1.0f) spread = 1.0f;
+    float r = (rndF(0,1) + rndF(0,1) + rndF(0,1)) / 3.0f;
+    int pos = (int)(target + (r - 0.5f) * 2.0f * spread + 0.5f);
+    if (pos < 0) pos = 0;
+    if (pos >= gSmpCount) pos = gSmpCount - 1;
+    return gSmpOrder[pos];
+}
+
+/* ── Read sample with lerp (int16 → float) ── */
+static inline float readSmp(int idx, float pos) {
+    int i0 = (int)pos;
+    int len = gSmpLen[idx];
+    if (i0 < 0 || i0 >= len) return 0;
+    float frac = pos - (float)i0;
+    float s0 = (float)gSmpData[idx][i0] * (1.0f / 32767.0f);
+    float s1 = (i0 + 1 < len) ? (float)gSmpData[idx][i0 + 1] * (1.0f / 32767.0f) : 0;
+    return s0 + frac * (s1 - s0);
+}
+
+/* ── Helpers ─────────────────────────────── */
+static int countActive(void) {
+    int n = 0, i;
+    for (i = 0; i < MAX_VOICES; i++)
+        if (gV[i].active) n++;
+    return n;
+}
+
+static void triggerVoice(float sr, float texture) {
+    if (gSmpCount == 0) return;
+    int slot = -1, i;
+    for (i = 0; i < MAX_VOICES; i++)
+        if (!gV[i].active) { slot = i; break; }
+    if (slot < 0) return;
+
+    Voice* v = &gV[slot];
+    v->smpIdx   = selectSample(texture);
+    v->pos      = 0;
+    v->level    = rndF(0.15f, 0.65f);
+    v->pan      = rndF(0.0f, 1.0f);
+    float lo    = 0.7f + texture * 0.15f;
+    v->pitch    = rndF(lo, 1.0f);
+    v->released = 0;
+    env_init(&v->env, sr, ENV_ATK, ENV_REL);
+    env_trigger(&v->env);
+    v->active = 1;
+
+    rt_printf("► Voice %d: [%d] %s  pitch=%.2f  level=%.2f  pan=%.2f  dur=%.1fs\n",
+              slot, v->smpIdx, gSmpName[v->smpIdx],
+              v->pitch, v->level, v->pan,
+              (float)gSmpLen[v->smpIdx] / (sr * v->pitch));
+}
+
+/* ═══════════════════════════════════════════ */
+bool setup(BelaContext* ctx, void*) {
+    rt_printf("\n=== SOUNDSCAPE ENGINE ===\n\n");
+    gSeed = ctx->audioFrames * 7 + 31;
+
     int i;
-    for (i = 0; i < 4; i++) {
-        r->combBuf[i] = (float*)calloc(REV_MAX, sizeof(float));
-        r->combIdx[i] = 0;
-    }
-    for (i = 0; i < 2; i++) {
-        r->apBuf[i] = (float*)calloc(REV_MAX, sizeof(float));
-        r->apIdx[i] = 0;
+    for (i = 0; i < 4; i++)
+        pinMode(ctx, 0, i, OUTPUT);
+    for (i = 0; i < MAX_VOICES; i++)
+        gV[i].active = 0;
+    for (i = 0; i < 8; i++)
+        gKnob[i] = 0.5f;
+    gKnob[5] = 1.0f; /* filter starts fully open */
+
+    loadSamples("samples");
+
+    float sr = ctx->audioSampleRate;
+    reverb_init(&gRevL, sr); reverb_init(&gRevR, sr);
+    reverb_setDecay(&gRevL, 0.8f); reverb_setDecay(&gRevR, 0.82f);
+    delay_init(&gDlyL, sr); delay_init(&gDlyR, sr);
+    svf_init(&gFltL, sr); svf_init(&gFltR, sr);
+    gOvdL.gain = 1.0f; gOvdR.gain = 1.0f;
+
+    gNextTrig = (int)(rndF(0.2f, 1.0f) * sr);
+    rt_printf("SR=%.0f  Ready.\n\n", sr);
+    return true;
+}
+
+/* ═══════════════════════════════════════════ */
+void render(BelaContext* ctx, void*) {
+    float sr = ctx->audioSampleRate;
+    int aDiv = (int)(sr / ctx->analogSampleRate + 0.5f);
+    unsigned int n;
+
+    for (n = 0; n < ctx->audioFrames; n++) {
+
+        /* ── Knobs ──────────────────────────── */
+        if (ctx->analogInChannels >= 8) {
+            unsigned int af = n / aDiv;
+            if (af < ctx->analogFrames) {
+                int k;
+                for (k = 0; k < 8; k++) {
+                    float raw = analogRead(ctx, af, k);
+                    gKnob[k] += 0.005f * (raw - gKnob[k]);
+                }
+            }
+        }
+
+        int   maxVc   = 1 + (int)(gKnob[0] * 9.0f);
+        float revMix  = gKnob[1];
+        float dlyMix  = gKnob[2];
+        float dlyTime = 0.05f + gKnob[3] * 0.7f;
+        float drv     = gKnob[4];
+        float fCut    = 200.0f + gKnob[5] * 6800.0f;
+        float tex     = gKnob[6];
+        float master  = gKnob[7] * gKnob[7] * 4.0f; /* quadratic taper */
+
+        delay_setTime(&gDlyL, dlyTime * 0.75f);
+        delay_setTime(&gDlyR, dlyTime);
+        delay_setFeedback(&gDlyL, 0.3f + dlyMix * 0.35f);
+        delay_setFeedback(&gDlyR, 0.3f + dlyMix * 0.35f);
+        delay_setMix(&gDlyL, dlyMix);
+        delay_setMix(&gDlyR, dlyMix);
+        reverb_setDecay(&gRevL, 0.6f + revMix * 0.35f);
+        reverb_setDecay(&gRevR, 0.62f + revMix * 0.35f);
+        drive_set(&gOvdL, drv);
+        drive_set(&gOvdR, drv);
+        svf_setParams(&gFltL, fCut, 0.707f);
+        svf_setParams(&gFltR, fCut, 0.707f);
+
+        /* ── Trigger ────────────────────────── */
+        gClock++;
+        if (gClock >= gNextTrig) {
+            if (countActive() < maxVc && gSmpCount > 0) {
+                triggerVoice(sr, tex);
+                gTrigLed = 1.0f;
+                float df = 1.0f - gKnob[0];
+                gNextTrig = gClock + (int)(rndF(0.1f+df*0.5f, 0.1f+df*3.9f) * sr);
+            } else {
+                gNextTrig = gClock + (int)(0.05f * sr);
+            }
+        }
+
+        /* ── Mix voices ─────────────────────── */
+        float mL = 0, mR = 0;
+        int v, nActive = 0;
+        for (v = 0; v < MAX_VOICES; v++) {
+            if (!gV[v].active) continue;
+            nActive++;
+
+            int sLen = gSmpLen[gV[v].smpIdx];
+            float left = ((float)sLen - gV[v].pos) / gV[v].pitch;
+            if (!gV[v].released && left <= REL_EARLY * sr) {
+                env_release(&gV[v].env);
+                gV[v].released = 1;
+            }
+
+            float s = readSmp(gV[v].smpIdx, gV[v].pos);
+            gV[v].pos += gV[v].pitch;
+
+            if ((int)gV[v].pos >= sLen) {
+                env_release(&gV[v].env);
+                gV[v].released = 1;
+            }
+
+            float e = env_process(&gV[v].env);
+            if (gV[v].env.state == ENV_IDLE ||
+                ((int)gV[v].pos >= sLen && e < 0.001f)) {
+                gV[v].active = 0;
+                nActive--;
+                continue;
+            }
+
+            float out = s * e * gV[v].level;
+            float pa = gV[v].pan * 1.5707963f;
+            mL += out * cosf(pa);
+            mR += out * sinf(pa);
+        }
+
+        /* Scale down by sqrt of active voices to keep headroom */
+        if (nActive > 1) {
+            float scale = 1.0f / sqrtf((float)nActive);
+            mL *= scale;
+            mR *= scale;
+        }
+
+        /* ── FX ─────────────────────────────── */
+        if (drv > 0.05f) {
+            mL = drive_process(&gOvdL, mL);
+            mR = drive_process(&gOvdR, mR);
+        }
+        if (gKnob[5] < 0.9f) {
+            mL = svf_process(&gFltL, mL);
+            mR = svf_process(&gFltR, mR);
+        }
+        if (dlyMix > 0.01f) {
+            mL = delay_process(&gDlyL, mL);
+            mR = delay_process(&gDlyR, mR);
+        }
+        if (revMix > 0.01f) {
+            float rL = reverb_process(&gRevL, mL);
+            float rR = reverb_process(&gRevR, mR);
+            mL = mL * (1.0f - revMix) + rL * revMix;
+            mR = mR * (1.0f - revMix) + rR * revMix;
+        }
+        mL = tanhf(mL * master);
+        mR = tanhf(mR * master);
+
+        audioWrite(ctx, n, 0, mL);
+        audioWrite(ctx, n, 1, mR);
+
+        /* ── LEDs ───────────────────────────── */
+        if ((n & 63) == 0) {
+            digitalWriteOnce(ctx, n, 0, countActive() > 2 ? 1 : 0);
+            digitalWriteOnce(ctx, n, 1, gTrigLed > 0.5f ? 1 : 0);
+            gTrigLed *= 0.92f;
+            digitalWriteOnce(ctx, n, 2, (fabsf(mL)+fabsf(mR)) > 0.1f ? 1 : 0);
+            gHbPhase += 64.0f / sr;
+            if (gHbPhase > 2.0f) gHbPhase -= 2.0f;
+            float hb = gHbPhase < 1.0f ? 0.5f*(1.0f+sinf(gHbPhase*6.2832f)) : 0;
+            digitalWriteOnce(ctx, n, 3, hb > 0.5f ? 1 : 0);
+        }
     }
 }
 
-void reverb_setDecay(Reverb* r, float d) {
-    r->decay = 0.7f + 0.28f * clampf(d, 0.0f, 1.0f);
-}
-
-float reverb_process(Reverb* r, float in) {
-    float out = 0;
+/* ═══════════════════════════════════════════ */
+void cleanup(BelaContext*, void*) {
     int i;
-    for (i = 0; i < 4; i++) {
-        int idx = (r->combIdx[i] - r->combLen[i] + REV_MAX) % REV_MAX;
-        float del = r->combBuf[i][idx];
-        r->combBuf[i][r->combIdx[i]] = in + del * r->decay;
-        r->combIdx[i] = (r->combIdx[i] + 1) % REV_MAX;
-        out += del;
-    }
-    out *= 0.25f;
-    for (i = 0; i < 2; i++) {
-        int idx = (r->apIdx[i] - r->apLen[i] + REV_MAX) % REV_MAX;
-        float del = r->apBuf[i][idx];
-        float tmp = out + del * (-0.5f);
-        r->apBuf[i][r->apIdx[i]] = tmp;
-        r->apIdx[i] = (r->apIdx[i] + 1) % REV_MAX;
-        out = del + tmp * 0.5f;
-    }
-    return out;
-}
-
-/* ── Delay ────────────────────────────────── */
-
-void delay_init(Delay* d, float sr) {
-    d->sr = sr;
-    d->len = DLY_MAX;
-    d->buf = (float*)calloc(DLY_MAX, sizeof(float));
-    d->writeIdx = 0;
-    d->delaySamp = DLY_MAX / 2;
-    d->feedback = 0.4f;
-    d->mix = 0.3f;
-    onepole_init(&d->lpf, sr);
-    onepole_setCutoff(&d->lpf, 3500.0f);
-}
-
-void delay_setTime(Delay* d, float sec) {
-    int s = (int)(sec * d->sr);
-    if (s < 1) s = 1;
-    if (s >= d->len) s = d->len - 1;
-    d->delaySamp = s;
-}
-void delay_setFeedback(Delay* d, float fb) { d->feedback = clampf(fb, 0, 0.92f); }
-void delay_setMix(Delay* d, float m) { d->mix = clampf(m, 0, 1); }
-
-float delay_process(Delay* d, float in) {
-    int ri = (d->writeIdx - d->delaySamp + d->len) % d->len;
-    float del = d->buf[ri];
-    float flt = onepole_process(&d->lpf, del);
-    float fb  = tanhf(flt * d->feedback);
-    d->buf[d->writeIdx] = in + fb;
-    d->writeIdx = (d->writeIdx + 1) % d->len;
-    return in * (1.0f - d->mix) + del * d->mix;
-}
-
-/* ── Drive ────────────────────────────────── */
-
-float drive_process(Drive* d, float in) {
-    return tanhf(in * d->gain) * 0.7f;
-}
-
-/* ── Envelope ─────────────────────────────── */
-
-void env_init(Env* e, float sr, float atk, float rel) {
-    e->sr = sr;
-    e->value = 0;
-    e->state = ENV_IDLE;
-    e->attackInc = 1.0f / (atk * sr);
-    e->relCoeff = expf(-4.6f / (rel * sr));
-}
-void env_trigger(Env* e) { e->state = ENV_ATTACK; }
-void env_release(Env* e) { if (e->state != ENV_IDLE) e->state = ENV_RELEASE; }
-
-float env_process(Env* e) {
-    switch (e->state) {
-    case ENV_ATTACK:
-        e->value += e->attackInc;
-        if (e->value >= 1.0f) { e->value = 1.0f; e->state = ENV_SUSTAIN; }
-        break;
-    case ENV_SUSTAIN:
-        break;
-    case ENV_RELEASE:
-        e->value *= e->relCoeff;
-        if (e->value < 0.001f) { e->value = 0; e->state = ENV_IDLE; }
-        break;
-    default:
-        e->value = 0;
-        break;
-    }
-    return e->value;
+    for (i = 0; i < gSmpCount; i++)
+        free(gSmpData[i]);
+    rt_printf("Stopped.\n");
 }
