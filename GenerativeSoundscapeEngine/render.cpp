@@ -26,6 +26,8 @@
 static short* gSmpData[MAX_SAMPLES];
 static int    gSmpLen[MAX_SAMPLES];
 static float  gSmpEnergy[MAX_SAMPLES];
+static float  gSmpRate[MAX_SAMPLES];  /* playback ratio: originalSR / belaSR */
+static char   gSmpName[MAX_SAMPLES][64]; /* short filename for console */
 static int    gSmpOrder[MAX_SAMPLES]; /* sorted by energy */
 static int    gSmpCount = 0;
 
@@ -65,7 +67,7 @@ static float rndF(float lo, float hi) {
 /* Reads in small chunks to avoid large temporary buffers */
 #define LOAD_CHUNK 4096
 
-static int loadOneWav(const char* path) {
+static int loadOneWav(const char* path, float belaSR) {
     if (gSmpCount >= MAX_SAMPLES) return 0;
 
     SF_INFO info;
@@ -130,14 +132,23 @@ static int loadOneWav(const char* path) {
     gSmpData[idx]   = mono;
     gSmpLen[idx]    = written;
     gSmpEnergy[idx] = rms;
+    gSmpRate[idx]   = (float)info.samplerate / belaSR;
+
+    /* Extract just the filename from the path */
+    const char* slash = strrchr(path, '/');
+    const char* name = slash ? slash + 1 : path;
+    strncpy(gSmpName[idx], name, 63);
+    gSmpName[idx][63] = '\0';
+
     gSmpCount++;
 
-    rt_printf("  [%d] %s  %d fr  rms=%.4f\n", idx, path, written, rms);
+    rt_printf("  [%d] %s  %d fr  %dHz  ratio=%.3f  rms=%.4f\n",
+              idx, path, written, info.samplerate, gSmpRate[idx], rms);
     return 1;
 }
 
 /* ── Load all wavs from directory ────────── */
-static void loadSamples(const char* dir) {
+static void loadSamples(const char* dir, float belaSR) {
     DIR* d = opendir(dir);
     if (!d) { rt_printf("Cannot open %s\n", dir); return; }
 
@@ -174,7 +185,7 @@ static void loadSamples(const char* dir) {
     }
 
     for (i = 0; i < n; i++)
-        loadOneWav(paths[i]);
+        loadOneWav(paths[i], belaSR);
 
     /* Normalise energy to 0..1 */
     float maxE = 0;
@@ -248,12 +259,17 @@ static void triggerVoice(float sr, float texture) {
     v->pos      = 0;
     v->level    = rndF(0.15f, 0.65f);
     v->pan      = rndF(0.0f, 1.0f);
-    float lo    = 0.25f + texture * 0.45f;
-    v->pitch    = rndF(lo, 1.0f);
+    float lo    = 0.7f + texture * 0.15f;
+    v->pitch    = rndF(lo, 1.0f) * gSmpRate[v->smpIdx];
     v->released = 0;
     env_init(&v->env, sr, ENV_ATK, ENV_REL);
     env_trigger(&v->env);
     v->active = 1;
+
+    rt_printf("► Voice %d: [%d] %s  pitch=%.2f  level=%.2f  pan=%.2f  dur=%.1fs\n",
+              slot, v->smpIdx, gSmpName[v->smpIdx],
+              v->pitch, v->level, v->pan,
+              (float)gSmpLen[v->smpIdx] / (sr * v->pitch));
 }
 
 /* ═══════════════════════════════════════════ */
@@ -270,9 +286,9 @@ bool setup(BelaContext* ctx, void*) {
         gKnob[i] = 0.5f;
     gKnob[5] = 1.0f; /* filter starts fully open */
 
-    loadSamples("samples");
-
     float sr = ctx->audioSampleRate;
+    loadSamples("samples", sr);
+
     reverb_init(&gRevL, sr); reverb_init(&gRevR, sr);
     reverb_setDecay(&gRevL, 0.8f); reverb_setDecay(&gRevR, 0.82f);
     delay_init(&gDlyL, sr); delay_init(&gDlyR, sr);
