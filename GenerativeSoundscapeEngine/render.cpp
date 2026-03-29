@@ -1,9 +1,12 @@
 /*
  *  GENERATIVE SOUNDSCAPE ENGINE — Bela
  *
- *  Knobs 0-7: Density, Reverb, Delay, DelayTime,
- *             Drive, Filter, Texture, Volume
+ *  Knobs 0-7: Density, Energy, Pitch, (free),
+ *             Drive, Filter, Speed, Volume
  *  LEDs 0-3:  Activity, Trigger, Level, Heartbeat
+ *
+ *  Samples stored as 8-bit mu-law (1 byte/sample)
+ *  for maximum sample count in limited RAM.
  */
 
 #include <Bela.h>
@@ -16,19 +19,19 @@
 
 /* ── Config ─────────────────────────────── */
 #define MAX_VOICES   10
-#define MAX_SAMPLES  112
+#define MAX_SAMPLES  256
 #define ENV_ATK      0.5f
 #define ENV_REL      0.5f
 #define REL_EARLY    0.6f
-#define MAX_SMP_FRAMES (44100 * 60)  /* cap at 60 seconds per sample */
+#define MAX_SMP_FRAMES (44100 * 60)
 
-/* ── Sample bank (stored as 16-bit to halve RAM) ── */
-static short* gSmpData[MAX_SAMPLES];
+/* ── Sample bank (8-bit mu-law, 1 byte per sample) ── */
+static unsigned char* gSmpData[MAX_SAMPLES];
 static int    gSmpLen[MAX_SAMPLES];
 static float  gSmpEnergy[MAX_SAMPLES];
-static float  gSmpRate[MAX_SAMPLES];  /* playback ratio: originalSR / belaSR */
-static char   gSmpName[MAX_SAMPLES][64]; /* short filename for console */
-static int    gSmpOrder[MAX_SAMPLES]; /* sorted by energy */
+static float  gSmpRate[MAX_SAMPLES];
+static char   gSmpName[MAX_SAMPLES][64];
+static int    gSmpOrder[MAX_SAMPLES];
 static int    gSmpCount = 0;
 
 /* ── Voice ──────────────────────────────── */
@@ -43,8 +46,6 @@ typedef struct {
 static Voice gV[MAX_VOICES];
 
 /* ── Effects ────────────────────────────── */
-static Reverb gRevL, gRevR;
-static Delay  gDlyL, gDlyR;
 static Drive  gOvdL, gOvdR;
 static SVF    gFltL, gFltR;
 
@@ -64,7 +65,6 @@ static float rndF(float lo, float hi) {
 }
 
 /* ── Load one wav via libsndfile ─────────── */
-/* Reads in small chunks to avoid large temporary buffers */
 #define LOAD_CHUNK 4096
 
 static int loadOneWav(const char* path, float belaSR) {
@@ -78,23 +78,20 @@ static int loadOneWav(const char* path, float belaSR) {
     int frames = (int)info.frames;
     int ch = info.channels;
     if (frames <= 0 || ch <= 0) { sf_close(sf); return 0; }
-
-    /* Cap length to save RAM */
     if (frames > MAX_SMP_FRAMES) frames = MAX_SMP_FRAMES;
 
-    /* Allocate 16-bit mono output */
-    short* mono = (short*)malloc(frames * sizeof(short));
-    if (!mono) { sf_close(sf); return 0; }
+    /* Allocate 8-bit mu-law output */
+    unsigned char* encoded = (unsigned char*)malloc(frames);
+    if (!encoded) { sf_close(sf); return 0; }
 
-    /* Read in small chunks, mix to mono, convert to int16 */
-    float chunk[LOAD_CHUNK * 2]; /* supports up to stereo */
+    float chunk[LOAD_CHUNK * 2];
     int written = 0;
     double rmsSum = 0;
 
     while (written < frames) {
         int toRead = frames - written;
         if (toRead > LOAD_CHUNK) toRead = LOAD_CHUNK;
-        /* For >2 channels, use a heap buffer */
+
         float* buf = chunk;
         float* heapBuf = NULL;
         if (ch > 2) {
@@ -113,28 +110,23 @@ static int loadOneWav(const char* path, float belaSR) {
                 s += buf[i * ch + c];
             s /= (float)ch;
             rmsSum += (double)s * s;
-            /* Convert to int16 */
-            int v = (int)(s * 32767.0f);
-            if (v > 32767) v = 32767;
-            if (v < -32768) v = -32768;
-            mono[written + i] = (short)v;
+            encoded[written + i] = mulaw_encode(s);
         }
         written += got;
         if (heapBuf) free(heapBuf);
     }
     sf_close(sf);
 
-    if (written == 0) { free(mono); return 0; }
+    if (written == 0) { free(encoded); return 0; }
 
     float rms = sqrtf((float)(rmsSum / written));
 
     int idx = gSmpCount;
-    gSmpData[idx]   = mono;
+    gSmpData[idx]   = encoded;
     gSmpLen[idx]    = written;
     gSmpEnergy[idx] = rms;
     gSmpRate[idx]   = (float)info.samplerate / belaSR;
 
-    /* Extract just the filename from the path */
     const char* slash = strrchr(path, '/');
     const char* name = slash ? slash + 1 : path;
     strncpy(gSmpName[idx], name, 63);
@@ -152,15 +144,17 @@ static void loadSamples(const char* dir, float belaSR) {
     DIR* d = opendir(dir);
     if (!d) { rt_printf("Cannot open %s\n", dir); return; }
 
-    /* Collect names (simple fixed buffer) */
-    char paths[MAX_SAMPLES][256];
+    /* Collect filenames — heap-allocated for large counts */
+    char (*paths)[256] = (char(*)[256])malloc(MAX_SAMPLES * 256);
+    if (!paths) { closedir(d); rt_printf("No RAM for path list\n"); return; }
+
     int n = 0;
     struct dirent* e;
     while ((e = readdir(d)) != NULL && n < MAX_SAMPLES) {
         int len = strlen(e->d_name);
         if (len < 5) continue;
         const char* ext = e->d_name + len - 4;
-        if ((ext[0]=='.' || ext[0]=='.') &&
+        if ((ext[0]=='.') &&
             (ext[1]=='w' || ext[1]=='W') &&
             (ext[2]=='a' || ext[2]=='A') &&
             (ext[3]=='v' || ext[3]=='V'))
@@ -187,6 +181,8 @@ static void loadSamples(const char* dir, float belaSR) {
     for (i = 0; i < n; i++)
         loadOneWav(paths[i], belaSR);
 
+    free(paths);
+
     /* Normalise energy to 0..1 */
     float maxE = 0;
     for (i = 0; i < gSmpCount; i++)
@@ -210,8 +206,8 @@ static void loadSamples(const char* dir, float belaSR) {
     /* Report memory usage */
     long totalBytes = 0;
     for (i = 0; i < gSmpCount; i++)
-        totalBytes += gSmpLen[i] * (long)sizeof(short);
-    rt_printf("Loaded %d samples. Total RAM: %.1f MB (16-bit)\n",
+        totalBytes += gSmpLen[i];
+    rt_printf("Loaded %d samples. Total RAM: %.1f MB (8-bit mu-law)\n",
               gSmpCount, totalBytes / (1024.0f * 1024.0f));
 }
 
@@ -228,14 +224,14 @@ static int selectSample(float texture) {
     return gSmpOrder[pos];
 }
 
-/* ── Read sample with lerp (int16 → float) ── */
+/* ── Read sample with lerp (mu-law decode) ── */
 static inline float readSmp(int idx, float pos) {
     int i0 = (int)pos;
     int len = gSmpLen[idx];
     if (i0 < 0 || i0 >= len) return 0;
     float frac = pos - (float)i0;
-    float s0 = (float)gSmpData[idx][i0] * (1.0f / 32767.0f);
-    float s1 = (i0 + 1 < len) ? (float)gSmpData[idx][i0 + 1] * (1.0f / 32767.0f) : 0;
+    float s0 = mulaw_decode(gSmpData[idx][i0]);
+    float s1 = (i0 + 1 < len) ? mulaw_decode(gSmpData[idx][i0 + 1]) : 0;
     return s0 + frac * (s1 - s0);
 }
 
@@ -247,7 +243,7 @@ static int countActive(void) {
     return n;
 }
 
-static void triggerVoice(float sr, float texture) {
+static void triggerVoice(float sr, float energy, float pitchRange) {
     if (gSmpCount == 0) return;
     int slot = -1, i;
     for (i = 0; i < MAX_VOICES; i++)
@@ -255,11 +251,12 @@ static void triggerVoice(float sr, float texture) {
     if (slot < 0) return;
 
     Voice* v = &gV[slot];
-    v->smpIdx   = selectSample(texture);
+    v->smpIdx   = selectSample(energy);
     v->pos      = 0;
     v->level    = rndF(0.15f, 0.65f);
     v->pan      = rndF(0.0f, 1.0f);
-    float lo    = 0.7f + texture * 0.15f;
+    /* pitchRange: 0 = original only, 1 = down to 0.5x */
+    float lo    = 1.0f - pitchRange * 0.5f;
     v->pitch    = rndF(lo, 1.0f) * gSmpRate[v->smpIdx];
     v->released = 0;
     env_init(&v->env, sr, ENV_ATK, ENV_REL);
@@ -277,6 +274,9 @@ bool setup(BelaContext* ctx, void*) {
     rt_printf("\n=== SOUNDSCAPE ENGINE ===\n\n");
     gSeed = ctx->audioFrames * 7 + 31;
 
+    /* Init mu-law decode table */
+    mulaw_init();
+
     int i;
     for (i = 0; i < 4; i++)
         pinMode(ctx, 0, i, OUTPUT);
@@ -285,15 +285,15 @@ bool setup(BelaContext* ctx, void*) {
     for (i = 0; i < 8; i++)
         gKnob[i] = 0.5f;
     gKnob[5] = 1.0f; /* filter starts fully open */
+    gKnob[6] = 1.0f; /* speed starts at normal */
 
     float sr = ctx->audioSampleRate;
     loadSamples("samples", sr);
 
-    reverb_init(&gRevL, sr); reverb_init(&gRevR, sr);
-    reverb_setDecay(&gRevL, 0.8f); reverb_setDecay(&gRevR, 0.82f);
-    delay_init(&gDlyL, sr); delay_init(&gDlyR, sr);
-    svf_init(&gFltL, sr); svf_init(&gFltR, sr);
-    gOvdL.gain = 1.0f; gOvdR.gain = 1.0f;
+    svf_init(&gFltL, sr);
+    svf_init(&gFltR, sr);
+    gOvdL.gain = 1.0f;
+    gOvdR.gain = 1.0f;
 
     gNextTrig = (int)(rndF(0.2f, 1.0f) * sr);
     rt_printf("SR=%.0f  Ready.\n\n", sr);
@@ -320,23 +320,18 @@ void render(BelaContext* ctx, void*) {
             }
         }
 
-        int   maxVc   = 1 + (int)(gKnob[0] * 9.0f);
-        float revMix  = gKnob[1];
-        float dlyMix  = gKnob[2];
-        float dlyTime = 0.05f + gKnob[3] * 0.7f;
-        float drv     = gKnob[4];
-        float fCut    = 200.0f + gKnob[5] * 6800.0f;
-        float tex     = gKnob[6];
-        float master  = gKnob[7] * gKnob[7] * 4.0f; /* quadratic taper */
+        int   maxVc    = 1 + (int)(gKnob[0] * 9.0f);
+        float energy   = gKnob[1];                       /* 0=calm, 1=intense */
+        float pitchRng = gKnob[2];                       /* 0=original, 1=lower */
+        /* gKnob[3] is free */
+        float drv      = gKnob[4];
+        float fCut     = 200.0f + gKnob[5] * 6800.0f;
+        /* Speed: CW=1.0 (normal), CCW=nearly frozen
+           Exponential curve so most of the range is usable */
+        float speed    = gKnob[6] * gKnob[6] * gKnob[6]; /* cubic: 0→0, 1→1 */
+        if (speed < 0.005f) speed = 0.005f;               /* never fully stopped */
+        float master   = gKnob[7] * gKnob[7] * 4.0f;
 
-        delay_setTime(&gDlyL, dlyTime * 0.75f);
-        delay_setTime(&gDlyR, dlyTime);
-        delay_setFeedback(&gDlyL, 0.3f + dlyMix * 0.35f);
-        delay_setFeedback(&gDlyR, 0.3f + dlyMix * 0.35f);
-        delay_setMix(&gDlyL, dlyMix);
-        delay_setMix(&gDlyR, dlyMix);
-        reverb_setDecay(&gRevL, revMix);
-        reverb_setDecay(&gRevR, revMix);
         drive_set(&gOvdL, drv);
         drive_set(&gOvdR, drv);
         svf_setParams(&gFltL, fCut, 0.707f);
@@ -346,7 +341,7 @@ void render(BelaContext* ctx, void*) {
         gClock++;
         if (gClock >= gNextTrig) {
             if (countActive() < maxVc && gSmpCount > 0) {
-                triggerVoice(sr, tex);
+                triggerVoice(sr, energy, pitchRng);
                 gTrigLed = 1.0f;
                 float df = 1.0f - gKnob[0];
                 gNextTrig = gClock + (int)(rndF(0.1f+df*0.5f, 0.1f+df*3.9f) * sr);
@@ -363,14 +358,14 @@ void render(BelaContext* ctx, void*) {
             nActive++;
 
             int sLen = gSmpLen[gV[v].smpIdx];
-            float left = ((float)sLen - gV[v].pos) / gV[v].pitch;
+            float left = ((float)sLen - gV[v].pos) / (gV[v].pitch * speed);
             if (!gV[v].released && left <= REL_EARLY * sr) {
                 env_release(&gV[v].env);
                 gV[v].released = 1;
             }
 
             float s = readSmp(gV[v].smpIdx, gV[v].pos);
-            gV[v].pos += gV[v].pitch;
+            gV[v].pos += gV[v].pitch * speed;
 
             if ((int)gV[v].pos >= sLen) {
                 env_release(&gV[v].env);
@@ -391,32 +386,28 @@ void render(BelaContext* ctx, void*) {
             mR += out * sinf(pa);
         }
 
-        /* Scale down by sqrt of active voices to keep headroom */
+        /* Scale by sqrt of active voices */
         if (nActive > 1) {
             float scale = 1.0f / sqrtf((float)nActive);
             mL *= scale;
             mR *= scale;
         }
 
-        /* ── FX ─────────────────────────────── */
+        /* ── FX chain ───────────────────────── */
+
+        /* 1. Overdrive */
         if (drv > 0.05f) {
             mL = drive_process(&gOvdL, mL);
             mR = drive_process(&gOvdR, mR);
         }
+
+        /* 2. Filter */
         if (gKnob[5] < 0.9f) {
             mL = svf_process(&gFltL, mL);
             mR = svf_process(&gFltR, mR);
         }
-        if (dlyMix > 0.01f) {
-            mL = delay_process(&gDlyL, mL);
-            mR = delay_process(&gDlyR, mR);
-        }
-        if (revMix > 0.01f) {
-            float rL = reverb_process(&gRevL, mL);
-            float rR = reverb_process(&gRevR, mR);
-            mL = mL * (1.0f - revMix) + rL * revMix;
-            mR = mR * (1.0f - revMix) + rR * revMix;
-        }
+
+        /* 3. Output soft clip */
         mL = tanhf(mL * master);
         mR = tanhf(mR * master);
 
