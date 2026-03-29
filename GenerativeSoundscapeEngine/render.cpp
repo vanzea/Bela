@@ -7,7 +7,7 @@
  */
 
 #include <Bela.h>
-#include <sndfile.h>
+#include <libraries/sndfile/sndfile.h>
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>
@@ -16,13 +16,14 @@
 
 /* ── Config ─────────────────────────────── */
 #define MAX_VOICES   10
-#define MAX_SAMPLES  32
+#define MAX_SAMPLES  112
 #define ENV_ATK      0.5f
 #define ENV_REL      0.5f
 #define REL_EARLY    0.6f
+#define MAX_SMP_FRAMES (44100 * 60)  /* cap at 60 seconds per sample */
 
-/* ── Sample bank ────────────────────────── */
-static float* gSmpData[MAX_SAMPLES];
+/* ── Sample bank (stored as 16-bit to halve RAM) ── */
+static short* gSmpData[MAX_SAMPLES];
 static int    gSmpLen[MAX_SAMPLES];
 static float  gSmpEnergy[MAX_SAMPLES];
 static int    gSmpOrder[MAX_SAMPLES]; /* sorted by energy */
@@ -61,6 +62,9 @@ static float rndF(float lo, float hi) {
 }
 
 /* ── Load one wav via libsndfile ─────────── */
+/* Reads in small chunks to avoid large temporary buffers */
+#define LOAD_CHUNK 4096
+
 static int loadOneWav(const char* path) {
     if (gSmpCount >= MAX_SAMPLES) return 0;
 
@@ -71,40 +75,64 @@ static int loadOneWav(const char* path) {
 
     int frames = (int)info.frames;
     int ch = info.channels;
-    if (frames <= 0) { sf_close(sf); return 0; }
+    if (frames <= 0 || ch <= 0) { sf_close(sf); return 0; }
 
-    /* Read interleaved */
-    float* raw = (float*)malloc(frames * ch * sizeof(float));
-    if (!raw) { sf_close(sf); return 0; }
-    sf_readf_float(sf, raw, frames);
+    /* Cap length to save RAM */
+    if (frames > MAX_SMP_FRAMES) frames = MAX_SMP_FRAMES;
+
+    /* Allocate 16-bit mono output */
+    short* mono = (short*)malloc(frames * sizeof(short));
+    if (!mono) { sf_close(sf); return 0; }
+
+    /* Read in small chunks, mix to mono, convert to int16 */
+    float chunk[LOAD_CHUNK * 2]; /* supports up to stereo */
+    int written = 0;
+    double rmsSum = 0;
+
+    while (written < frames) {
+        int toRead = frames - written;
+        if (toRead > LOAD_CHUNK) toRead = LOAD_CHUNK;
+        /* For >2 channels, use a heap buffer */
+        float* buf = chunk;
+        float* heapBuf = NULL;
+        if (ch > 2) {
+            heapBuf = (float*)malloc(toRead * ch * sizeof(float));
+            if (!heapBuf) break;
+            buf = heapBuf;
+        }
+
+        int got = (int)sf_readf_float(sf, buf, toRead);
+        if (got <= 0) { if (heapBuf) free(heapBuf); break; }
+
+        int i, c;
+        for (i = 0; i < got; i++) {
+            float s = 0;
+            for (c = 0; c < ch; c++)
+                s += buf[i * ch + c];
+            s /= (float)ch;
+            rmsSum += (double)s * s;
+            /* Convert to int16 */
+            int v = (int)(s * 32767.0f);
+            if (v > 32767) v = 32767;
+            if (v < -32768) v = -32768;
+            mono[written + i] = (short)v;
+        }
+        written += got;
+        if (heapBuf) free(heapBuf);
+    }
     sf_close(sf);
 
-    /* Mix to mono */
-    float* mono = (float*)malloc(frames * sizeof(float));
-    if (!mono) { free(raw); return 0; }
+    if (written == 0) { free(mono); return 0; }
 
-    int i, c;
-    for (i = 0; i < frames; i++) {
-        float s = 0;
-        for (c = 0; c < ch; c++)
-            s += raw[i * ch + c];
-        mono[i] = s / (float)ch;
-    }
-    free(raw);
-
-    /* Compute RMS */
-    double sum = 0;
-    for (i = 0; i < frames; i++)
-        sum += (double)mono[i] * mono[i];
-    float rms = sqrtf((float)(sum / frames));
+    float rms = sqrtf((float)(rmsSum / written));
 
     int idx = gSmpCount;
     gSmpData[idx]   = mono;
-    gSmpLen[idx]    = frames;
+    gSmpLen[idx]    = written;
     gSmpEnergy[idx] = rms;
     gSmpCount++;
 
-    rt_printf("  [%d] %s  %d fr  rms=%.4f\n", idx, path, frames, rms);
+    rt_printf("  [%d] %s  %d fr  rms=%.4f\n", idx, path, written, rms);
     return 1;
 }
 
@@ -168,7 +196,12 @@ static void loadSamples(const char* dir) {
         }
     }
 
-    rt_printf("Loaded %d samples.\n", gSmpCount);
+    /* Report memory usage */
+    long totalBytes = 0;
+    for (i = 0; i < gSmpCount; i++)
+        totalBytes += gSmpLen[i] * (long)sizeof(short);
+    rt_printf("Loaded %d samples. Total RAM: %.1f MB (16-bit)\n",
+              gSmpCount, totalBytes / (1024.0f * 1024.0f));
 }
 
 /* ── Energy-biased selection ─────────────── */
@@ -184,14 +217,14 @@ static int selectSample(float texture) {
     return gSmpOrder[pos];
 }
 
-/* ── Read sample with lerp ───────────────── */
+/* ── Read sample with lerp (int16 → float) ── */
 static inline float readSmp(int idx, float pos) {
     int i0 = (int)pos;
     int len = gSmpLen[idx];
     if (i0 < 0 || i0 >= len) return 0;
     float frac = pos - (float)i0;
-    float s0 = gSmpData[idx][i0];
-    float s1 = (i0 + 1 < len) ? gSmpData[idx][i0 + 1] : 0;
+    float s0 = (float)gSmpData[idx][i0] * (1.0f / 32767.0f);
+    float s1 = (i0 + 1 < len) ? (float)gSmpData[idx][i0 + 1] * (1.0f / 32767.0f) : 0;
     return s0 + frac * (s1 - s0);
 }
 
@@ -395,4 +428,3 @@ void cleanup(BelaContext*, void*) {
         free(gSmpData[i]);
     rt_printf("Stopped.\n");
 }
-
