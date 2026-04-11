@@ -12,40 +12,47 @@ The dry signal is preserved at unity gain throughout the entire chain — your k
 
 - **Bela** or **Bela Mini** with cape
 - 8× 10kΩ potentiometers wired to analog inputs **A0–A7**
-- 4× LEDs (with appropriate current-limiting resistors, ~330Ω) wired to digital pins **D0–D3**
+- 4× LEDs (with ~330Ω current-limiting resistors) wired to digital pins **D0–D3**
 - Stereo audio in / stereo audio out
 
 ## Controls
 
 | Pot | Name | Function |
 |-----|------|----------|
-| P0 | **Intensity** | Macro from clean (0) to mayhem (100). Fades in each effect along a curated curve. |
-| P1 | Drive character | Amount of saturation applied to the input |
-| P2 | Ring mod frequency | 20 Hz – 2 kHz, exponential. Tremolo at the bottom, metallic clang at the top. |
+| P0 | **Intensity** | Macro from clean (0) to mayhem (100) |
+| P1 | Drive character | Saturation amount |
+| P2 | Ring mod frequency | 20 Hz – 2 kHz, exponential |
 | P3 | Delay time | 30 ms – 1.2 s |
 | P4 | Stereo spread | Ping-pong L/R offset ratio |
 | P5 | Grain size | 10 ms – 400 ms |
 | P6 | Reverb size | Small room → cathedral |
-| P7 | Tilt EQ | Dark ↔ bright tone tilt on the wet bus |
+| P7 | Tilt EQ | Dark ↔ bright |
 
 ## LEDs
 
 | LED | Function |
 |-----|----------|
-| D0 | Intensity meter (PWM, perceptually compensated) |
-| D1 | Delay feedback level — warns of runaway |
+| D0 | Intensity meter (PWM) |
+| D1 | Delay feedback level |
 | D2 | Grain trigger flash |
 | D3 | Limiter activity |
 
-## Intensity zones (P0)
+## Project settings (Bela IDE)
 
-| P0 range | What happens |
-|----------|--------------|
-| 0–15 | Clean. Subtle saturation creeps in at the top edge. |
-| 15–35 | Drive grows; short delay and small reverb appear. |
-| 35–55 | Delay opens up, feedback rises; reverb tail lengthens. |
-| 55–75 | Ring mod and granular freezer engage. |
-| 75–90 | Granular density and pitch jitter ramp up; reverb approaches cathedral. |
-| 90–100 | Feedback near self-oscillation, grains pitch-shift wildly. Mayhem. |
+- Analog channels: **8 in**
+- Digital channels: **enabled**
+- Block size: **16**
 
-## Signal flow
+## Files
+
+- `render.cpp` — the effect implementation
+
+## Tweaking
+
+- `wideAmount` (default `1.6f`) — stereo width of wet bus
+- `xL = dryL + xL * 0.7f` — wet bus level
+- `kMaxGrains` — drop from 6 to 4 if CPU-tight
+
+## License
+
+Do whatever you want with it.
