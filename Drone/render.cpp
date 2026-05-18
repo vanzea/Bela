@@ -236,6 +236,11 @@ static OnePole sPitch, sSpread, sDrive, sGrainDens, sGrainTone,
 // slow swell LFO (~0.06 Hz measured)
 static float gSwellPhase = 0.0f;
 
+// sub-bass floor oscillator: a single deep sine roughly an octave below the
+// cluster fundamental. The source has a continuous foundation in the bottom
+// octave (~20-35 Hz) that the discrete partial cluster does not cover.
+static float gSubPhase = 0.0f;
+
 // final output DC blocker (per channel)
 static float gDcXl=0.0f, gDcYl=0.0f, gDcXr=0.0f, gDcYr=0.0f;
 
@@ -318,6 +323,10 @@ void render(BelaContext* context, void* userData)
     float spread = kSpread * 0.06f;
     // Pot 3  Drive        : tanh pre-gain 1..14 (seismic territory at the top)
     float drive  = 1.0f + kDrive * 13.0f;
+    // Drive also governs the sub-bass floor: a baseline amount is always
+    // present so the bottom octave is never empty, and it rises with Drive
+    // to reinforce the "seismic" gesture.
+    float subLevel = 0.22f + kDrive * 0.55f;             // ~0.22 .. 0.77
     // Pot 4  Grain Density
     float grainD = kGrainDens;
     // Pot 5  Grain Tone   : 60 Hz .. 6 kHz bandpass centre, exponential
@@ -362,10 +371,27 @@ void render(BelaContext* context, void* userData)
         driven *= (1.0f / (0.6f + 0.5f * drive));
         driven *= 1.7f;
 
+        // 3b) sub-bass floor ------------------------------------------------
+        // A deep sine an octave below the cluster fundamental, holding the
+        // bottom octave the discrete partials leave empty. Frequency is
+        // clamped to 20-42 Hz so it stays a genuine sub regardless of pitch.
+        // It is added AFTER saturation and lightly soft-clipped on its own,
+        // so it keeps a clean, deep tone rather than generating harmonics.
+        float subHz = clampf(baseHz * 0.5f, 20.0f, 42.0f);
+        gSubPhase += TPI * subHz * gInvSR;
+        if (gSubPhase >= TPI) gSubPhase -= TPI;
+        float sub = sinf(gSubPhase);
+        sub = tanhf(sub * 1.4f) * 0.85f;                   // gentle weight
+        sub *= swell;                                      // breathes with the cluster
+        float subOut = sub * subLevel;                     // kept separate, see below
+
         // 4) granular crackle layer ----------------------------------------
         float grain = gGrains.process(grainD, grainHz) * 0.85f;
 
-        // dry mono sum fed to the reverb
+        // dry mono sum fed to the reverb (cluster + grain only).
+        // The sub-bass deliberately does NOT enter the reverb: a long
+        // diffusion tail on a ~25 Hz tone builds muddy low-frequency rumble.
+        // The sub is added back as a clean, centred floor after the reverb.
         float dryMono = driven + grain;
 
         // 5) diffusion reverb ----------------------------------------------
@@ -382,6 +408,11 @@ void render(BelaContext* context, void* userData)
         float mono = 0.5f * (baseL + baseR);
         float outL = mono + width * (baseL - mono);
         float outR = mono + width * (baseR - mono);
+
+        // 6b) add the clean sub-bass floor, equally to both channels so it
+        //     stays solid and centred underneath the decorrelated field.
+        outL += subOut;
+        outR += subOut;
 
         // 7) DC blockers ----------------------------------------------------
         float yl = outL - gDcXl + 0.9985f * gDcYl;
@@ -444,7 +475,8 @@ void cleanup(BelaContext* context, void* userData)
 // ----------------------------------------------------------------------------
 //  0  DRIFT PITCH   base frequency of the cluster, 20-80 Hz (centre ~50)
 //  1  SPREAD        detune between the 6 partials -> beating / diffusion
-//  2  DRIVE         tanh saturation -> harmonic haze; full = seismic sub
+//  2  DRIVE         tanh saturation -> harmonic haze + sub-bass floor level;
+//                   full = seismic sub (grit and sub rise together)
 //  3  GRAIN DENSITY rate of the crackle layer, 0 to ~12 grains/sec
 //  4  GRAIN TONE    bandpass centre of the grains, 60 Hz - 6 kHz
 //  5  DIFFUSION     reverb decay length -> the "auroral" smear
